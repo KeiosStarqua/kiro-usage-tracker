@@ -15,6 +15,7 @@ A lightweight terminal dashboard that monitors your **Kiro CLI** token consumpti
 
 ## Features
 
+- **Credits** — real, Kiro-measured credit usage per day / session / model (current Kiro CLI)
 - **Real-time dashboard** — live-refreshing terminal UI (powered by [Rich](https://github.com/Textualize/rich))
 - **Session archiving** — background service snapshots sessions every 10 s; data survives `/clear` and Kiro restarts
 - **Cache breakdown** — separates CacheWrite (new tokens), CacheRead (context resent), and Output tokens
@@ -74,7 +75,13 @@ The background archiver watches the Kiro CLI SQLite database for changes and sna
 ## How It Works
 
 ```
-Kiro CLI / Kiro IDE
+Kiro CLI (current versions)
+  ~/.kiro/sessions/cli/<id>.json + <id>.jsonl
+        │   per-turn credits, requests, model  +  transcript
+        ▼
+  kiro-usage viewer   (reads the files directly, cached by mtime)
+
+Kiro CLI (older versions) / Kiro IDE
   SQLite database (~/.kiro/...)
         │
         │  file mtime poll (every 10 s)
@@ -86,14 +93,35 @@ Kiro CLI / Kiro IDE
   (on-demand, live-refresh)
 ```
 
-### Token Metrics
+Current Kiro CLI versions no longer keep conversations in `data.sqlite3`
+(the `conversations` tables are empty). They write one `.json` + `.jsonl` pair per
+session to `~/.kiro/sessions/cli/`, and those files already persist across `/clear`
+and restarts, so no archiver is needed for them. Override the location with
+`KIRO_CLI_SESSIONS_DIR`.
 
-| Metric | Description |
-|---|---|
-| **CacheWrite** | New tokens sent this turn (estimated, chars ÷ 4) |
-| **CacheRead** | Prior context resent to the API (estimated) |
-| **Output** | Tokens streamed back from the model (from chunks, accurate) |
-| **Cost** | Cache-aware estimate — write tokens at 5-min rate, read tokens at 1-hour rate |
+### Credits and token metrics
+
+| Metric | Source | Description |
+|---|---|---|
+| **Credits** | **measured** | Per-turn `metering_usage` recorded by Kiro — the authoritative usage number |
+| **Reqs** | measured | Model requests per turn (`total_request_count`) |
+| **CacheWrite** | estimated | New tokens sent this request (chars ÷ 4; images by pixel count) |
+| **CacheRead** | estimated | Prior context resent to the API on every request |
+| **Output** | estimated | Assistant text, tool calls and visible thinking (chars ÷ 4). Legacy DB: counted from streaming chunks |
+| **Cost** | estimated | Cache-aware USD estimate — write tokens at 5-min rate, read tokens at 1-hour rate |
+
+Kiro CLI does **not** record token counts (its `input_token_count` / `output_token_count`
+fields are always `0`), so tokens and USD are estimates. The transcript does not contain the
+system prompt, tool definitions or steering files that are sent with every request; that fixed
+overhead is recovered per session from Kiro's own `final_context_usage_percentage` × the model's
+context window, so the CacheRead figure is realistic rather than a floor. Treat the numbers as
+order-of-magnitude, and prefer **Credits** for anything you need to be exact. Turns that are still
+running (or were interrupted) have no credits yet — Kiro writes `metering_usage` when a turn ends — so
+they show tokens only.
+
+Models newer than the pricing table (e.g. `claude-sonnet-5.5`) are priced like the latest known
+model of the same family; non-Claude models (`gpt-*`, `glm-*`, `auto`) use the default rate, so
+their USD figure is only indicative — their credits are still exact.
 
 ---
 
@@ -109,7 +137,7 @@ No. It reads Kiro's local SQLite database directly — no network calls, no extr
 No. Everything stays local in `~/.kiro_sessions/`.
 
 **Q: Why do costs look like estimates?**
-Kiro doesn't expose the exact prompt/completion split, so input tokens are approximated from character count (÷ 4). Output tokens come from streaming chunks and are accurate.
+Kiro doesn't record token counts (they are `0` in its session files), so tokens are approximated from character count (÷ 4) and the USD figure is derived from them. Credits are the exact number — they come straight from Kiro's own metering.
 
 **Q: Does it work without systemd / launchd?**
 Yes. Run `kiro-usage-archiver` manually in a terminal, or just use `kiro-usage` without the background service (you'll only see current-session data without persistence across `/clear`).
