@@ -8,9 +8,10 @@ import json, sys, os, time, signal, platform
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import (CLI_DB, IDE_DB, SESSIONS_DIR, CHARS_PER_TOKEN, calc_cost, query,
-               c, fmt, fmt_cost, bar, tw,
+from . import (CLI_DB, IDE_DB, SESSIONS_DIR, CLI_SESSIONS_DIR, CHARS_PER_TOKEN, calc_cost, query,
+               c, fmt, fmt_cost, fmt_credits, bar, tw,
                vpad, vlpad, box_top, box_bot, box_sep, box_line)
+from . import cli_sessions
 from .archiver import load_archived_sessions
 
 _cache = {}  # conversation_id -> parsed result (keyed by updated_at)
@@ -170,6 +171,17 @@ def load_all_sessions(days=None):
         _cache[cid] = parsed
         seen[cid] = parsed
 
+    # kiro-cli sessions store (~/.kiro/sessions/cli): real credits + estimated tokens
+    for sess in cli_sessions.load_sessions(cutoff_ms):
+        summ = cli_sessions.summarize(sess, cutoff_ms)
+        if summ:
+            seen[summ["full_id"]] = summ
+
+    for cv in seen.values():  # legacy sources have no credits
+        cv.setdefault("credits", 0.0)
+        for d in cv["daily"].values():
+            d.setdefault("credits", 0.0)
+
     return sorted(seen.values(), key=lambda x: x["updated"], reverse=True)
 
 # ── Load IDE usage (Kiro IDE token data) ──────────────────────────────────────
@@ -231,6 +243,17 @@ def load_ide_usage(days=None):
     return {**totals, "daily": daily}
 
 # ── Render ────────────────────────────────────────────────────────────────────
+def _fit(label, parts, width):
+    """Join ``(styled, visible_len)`` parts after ``label`` and drop what overflows the box."""
+    budget = width - 4 - len(label)
+    out, used = [], 0
+    for text, n in parts:
+        if used + n + (2 if out else 0) > budget:
+            break
+        out.append(text)
+        used += n + (2 if len(out) > 1 else 0)
+    return label + "  ".join(out)
+
 def render(days, max_sessions=5):
     cli_convos = load_all_sessions(days)
     w = min(tw(), 120)
@@ -254,6 +277,8 @@ def render(days, max_sessions=5):
         t_out  = sum(cv["out"]  for cv in cli_convos)
         t_cost = sum(cv["cost"] for cv in cli_convos)
         t_reqs = sum(cv["turns"] for cv in cli_convos)
+        t_cred = sum(cv["credits"] for cv in cli_convos)
+        show_cred = t_cred > 0
         all_models = set()
         for cv in cli_convos:
             all_models.update(cv["models"])
@@ -263,30 +288,47 @@ def render(days, max_sessions=5):
                 c(t_reqs, "bold", "white"), c(fmt(t_cw), "green"),
                 c(fmt(t_cr), "yellow"), c(fmt(t_out), "blue"),
                 c(fmt_cost(t_cost), "red", "bold")), w))
+        if show_cred:
+            L.append(box_line(
+                "Credits {}  {}".format(
+                    c(fmt_credits(t_cred), "bold", "magenta"),
+                    c("(measured by Kiro; tokens & $ are estimates)", "dim")), w))
         if all_models:
             # Count turns per model
             model_counts = {}
             for cv in cli_convos:
                 for m in cv["models"]:
                     model_counts[m] = model_counts.get(m, 0) + cv["turns"]
-            parts = ["{}{}{}".format(c(m, "magenta"), c("x", "dim"), c(n, "bold"))
-                      for m, n in sorted(model_counts.items(), key=lambda x: -x[1])]
-            L.append(box_line("Models: " + "  ".join(parts), w))
+            parts = [("{}{}{}".format(c(m, "magenta"), c(" x", "dim"), c(n, "bold")),
+                      len(m) + 2 + len(str(n)))
+                     for m, n in sorted(model_counts.items(), key=lambda x: -x[1])]
+            L.append(box_line(_fit("Models: ", parts, w), w))
+            if show_cred:
+                mc = {}
+                for cv in cli_convos:
+                    for m, v in cv.get("model_credits", {}).items():
+                        mc[m] = mc.get(m, 0.0) + v
+                parts = [("{} {}".format(c(m, "magenta"), c(fmt_credits(v), "bold")),
+                          len(m) + 1 + len(fmt_credits(v)))
+                         for m, v in sorted(mc.items(), key=lambda x: -x[1]) if v > 0]
+                if parts:
+                    L.append(box_line(_fit("Credits by model: ", parts, w), w))
 
         # Daily breakdown
         cli_daily = {}
         for cv in cli_convos:
             for d, v in cv["daily"].items():
                 if d not in cli_daily:
-                    cli_daily[d] = {"cw": 0, "cr": 0, "out": 0, "cost": 0.0, "reqs": 0}
-                for k in ("cw", "cr", "out", "cost", "reqs"):
+                    cli_daily[d] = {"cw": 0, "cr": 0, "out": 0, "cost": 0.0, "credits": 0.0, "reqs": 0}
+                for k in ("cw", "cr", "out", "cost", "credits", "reqs"):
                     cli_daily[d][k] += v[k]
 
         if cli_daily:
             L.append(box_sep(w))
             max_r = max(v["reqs"] for v in cli_daily.values())
-            hdr = "{} {:>5} {:>8} {:>8} {:>7} {:>8}  {}".format(
-                vpad("Date", 12), "Reqs", "CWrite", "CRead", "Output", "Cost", "Activity")
+            hdr = "{} {:>5} {:>8} {:>8} {:>7} {:>8}{}  {}".format(
+                vpad("Date", 12), "Reqs", "CWrite", "CRead", "Output", "Cost",
+                " {:>7}".format("Credits") if show_cred else "", "Activity")
             L.append(box_line(c(hdr, "dim"), w))
 
             for d in sorted(cli_daily.keys(), reverse=True):
@@ -297,10 +339,12 @@ def render(days, max_sessions=5):
                 marker = c("> ", "cyan") if is_today else "  "
                 reqs_c = c(str(v["reqs"]), "bold") if is_today else str(v["reqs"])
                 cost_c = c(fmt_cost(v["cost"]), "red") if v["cost"] >= 0.1 else fmt_cost(v["cost"])
-                line = "{}{} {} {} {} {} {}  {}".format(
+                cred_c = " " + vlpad(c(fmt_credits(v["credits"]), "magenta"), 7) if show_cred else ""
+                line = "{}{} {} {} {} {} {}{}  {}".format(
                     marker, vpad(day_c, 10), vlpad(reqs_c, 5),
                     vlpad(fmt(v["cw"]), 8), vlpad(fmt(v["cr"]), 8),
-                    vlpad(fmt(v["out"]), 7), vlpad(cost_c, 8), bar(pct))
+                    vlpad(fmt(v["out"]), 7), vlpad(cost_c, 8), cred_c,
+                    bar(pct, max(8, min(20, w - 3 - (63 if show_cred else 55)))))
                 L.append(box_line(line, w))
 
         # Tool usage
@@ -324,15 +368,17 @@ def render(days, max_sessions=5):
 
         # Sessions (recent only)
         L.append(box_sep(w))
-        shdr = "{} {} {:>5} {:>7} {:>7} {:>6} {:>6} {}".format(
-            vpad("ID", 8), vpad("Directory", 18),
-            "Turns", "CWrite", "CRead", "Out", "Cost", "Updated")
+        dir_w = max(10, min(18, w - 3 - (67 if show_cred else 59)))
+        shdr = "{} {} {:>5} {:>7} {:>7} {:>6} {:>6}{} {}".format(
+            vpad("ID", 8), vpad("Directory", dir_w),
+            "Turns", "CWrite", "CRead", "Out", "Cost",
+            " {:>7}".format("Credits") if show_cred else "", "Updated")
         L.append(box_line(c(shdr, "dim"), w))
 
         for cv in cli_convos[:max_sessions]:
             cwd = cv["cwd"].replace(str(Path.home()), "~")
-            if len(cwd) > 17:
-                cwd = ".." + cwd[-15:]
+            if len(cwd) > dir_w - 1:
+                cwd = ".." + cwd[-(dir_w - 3):]
             age = datetime.now() - cv["updated"]
             if age < timedelta(hours=1):
                 dot, ts = c("*", "green"), cv["updated"].strftime("%H:%M")
@@ -341,10 +387,11 @@ def render(days, max_sessions=5):
             else:
                 dot, ts = c(".", "dim"), cv["updated"].strftime("%m-%d %H:%M")
             updated = vpad("{} {}".format(dot, ts), 13)
-            line = "{} {} {:>5} {:>7} {:>7} {:>6} {:>6} {}".format(
-                vpad(c(cv["id"], "cyan"), 8), vpad(cwd, 18), cv["turns"],
+            cred_c = " " + vlpad(c(fmt_credits(cv["credits"]), "magenta"), 7) if show_cred else ""
+            line = "{} {} {:>5} {:>7} {:>7} {:>6} {:>6}{} {}".format(
+                vpad(c(cv["id"], "cyan"), 8), vpad(cwd, dir_w), cv["turns"],
                 fmt(cv["cw"]), fmt(cv["cr"]), fmt(cv["out"]),
-                fmt_cost(cv["cost"]), updated)
+                fmt_cost(cv["cost"]), cred_c, updated)
             L.append(box_line(line, w))
         if len(cli_convos) > max_sessions:
             L.append(box_line(c("  … and {} more (use --all to show)".format(
@@ -358,10 +405,13 @@ def render(days, max_sessions=5):
     # ide = load_ide_usage(days)
 
     # ── Total ─────────────────────────────────────────────────────────────
-    if cli_total_cost > 0:
+    total_credits = sum(cv["credits"] for cv in cli_convos) if cli_convos else 0
+    if cli_total_cost > 0 or total_credits > 0:
         L.append("")
-        L.append("  " + c("Estimated cost: ", "dim") +
-                 c(fmt_cost(cli_total_cost), "bold", "red"))
+        line = "  " + c("Estimated cost: ", "dim") + c(fmt_cost(cli_total_cost), "bold", "red")
+        if total_credits > 0:
+            line += c("   Credits used: ", "dim") + c(fmt_credits(total_credits), "bold", "magenta")
+        L.append(line)
 
     from .service import _has_systemd, _launchd_plist_path
     has_archiver = (platform.system() == "Darwin" and _launchd_plist_path().exists()) or \
@@ -374,8 +424,44 @@ def render(days, max_sessions=5):
     return "\n".join(L)
 
 # ── Session detail view ───────────────────────────────────────────────────────
+# ── Session detail view ───────────────────────────────────────────────────────
+def _render_cli_session(sess):
+    """Per-turn breakdown for a session from the ~/.kiro/sessions/cli store."""
+    w = min(tw(), 120)
+    rows = sess["rows"]
+    L = [""]
+    L.append("  " + c("Session ", "bold", "cyan") + c(sess["id"], "cyan") +
+             "   " + c(sess["cwd"].replace(str(Path.home()), "~"), "dim"))
+    if sess["title"]:
+        L.append("  " + c(sess["title"][:w - 4], "dim"))
+    L.append("")
+    hdr = " {:>4}  {:>5}  {:>8}  {:>8}  {:>7}  {:>8}  {:>7}  {:<18}  {}".format(
+        "#", "Reqs", "CWrite", "CRead", "Out", "Credits", "Cost", "Model", "Time")
+    L.append(c(hdr, "dim"))
+    for i, r in enumerate(rows):
+        ts = datetime.fromtimestamp(r["ts_ms"] / 1000).strftime("%m-%d %H:%M:%S")
+        tools = [t for t in r["tools"][:3]]
+        tool_str = "  " + c(",".join(tools), "dim") if tools else ""
+        L.append(" {:>4}  {:>5}  {:>8}  {:>8}  {:>7}  {:>8}  {:>7}  {:<18}  {}{}".format(
+            i, r["reqs"], fmt(int(r["cw"])), fmt(int(r["cr"])), fmt(int(r["out"])),
+            fmt_credits(r["credits"]) if r["meta"] else "-", fmt_cost(r["cost"]),
+            (r["model"] or "")[:18], ts, tool_str))
+    L.append("")
+    L.append("  " + c("Total: ", "dim") +
+             c("{} credits".format(fmt_credits(sum(r["credits"] for r in rows))), "bold", "magenta") +
+             "  " + c(fmt_cost(sum(r["cost"] for r in rows)), "bold", "red") +
+             c("  ({} turns, {} requests; tokens & $ estimated)".format(
+                 len(rows), sum(r["reqs"] for r in rows)), "dim"))
+    L.append("")
+    return "\n".join(L)
+
+
 def render_session(prefix):
     """Show per-turn breakdown for a session matching the given ID prefix."""
+    for sess in cli_sessions.load_sessions():
+        if sess["full_id"].startswith(prefix):
+            return _render_cli_session(sess)
+
     # Find matching conversation from all sources
     data, cid, cwd = None, None, None
     for snap in load_archived_sessions():
@@ -474,15 +560,17 @@ def view_json(days):
                 out["cli"]["daily"][d] = {
                     "requests": 0, "cache_write_est": 0,
                     "cache_read_est": 0, "output_tokens": 0, "cost_est_usd": 0.0,
+                    "credits": 0.0,
                 }
             for k, jk in [("reqs", "requests"), ("cw", "cache_write_est"),
                            ("cr", "cache_read_est"), ("out", "output_tokens"),
-                           ("cost", "cost_est_usd")]:
+                           ("cost", "cost_est_usd"), ("credits", "credits")]:
                 out["cli"]["daily"][d][jk] += v[k]
         out["cli"]["sessions"].append({
             "id": cv["id"], "cwd": cv["cwd"], "turns": cv["turns"],
             "cache_write_est": cv["cw"], "cache_read_est": cv["cr"],
             "output_tokens": cv["out"], "cost_est_usd": round(cv["cost"], 4),
+            "credits": round(cv["credits"], 4),
             "models": list(cv["models"]),
             "created": cv["created"].isoformat(),
             "updated": cv["updated"].isoformat(),
@@ -490,10 +578,13 @@ def view_json(days):
     for d in out["cli"]["daily"]:
         out["cli"]["daily"][d]["cost_est_usd"] = round(
             out["cli"]["daily"][d]["cost_est_usd"], 4)
+        out["cli"]["daily"][d]["credits"] = round(
+            out["cli"]["daily"][d]["credits"], 4)
 
     # IDE disabled — data too incomplete for reliable estimates
     # ide = load_ide_usage(days)
     out["combined_cost_est_usd"] = round(cli_total_cost, 4)
+    out["total_credits"] = round(sum(cv["credits"] for cv in cli_convos), 4)
     print(json.dumps(out, indent=2))
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -553,9 +644,10 @@ def main():
     --no-live   Print once and exit
 
   {} (CLI only)
+    💳 Credits     = measured by Kiro (per-turn metering) — the authoritative number
     ✏️  CacheWrite  = new tokens per turn (estimated, chars/4)
     📖 CacheRead   = prior context resent to API (estimated)
-    📤 Output      = tokens streamed back (from chunks, accurate)
+    📤 Output      = tokens generated incl. thinking (estimated; legacy DB: from chunks)
     💰 Cost        = cache-aware pricing estimate
 
   {} (5-min cache write rate)
@@ -564,16 +656,18 @@ def main():
     claude-opus-4.5    $6.25     $0.50    $25/MTok
     claude-opus-4.1    $18.75    $1.50    $75/MTok
     claude-sonnet-4.x  $3.75     $0.30    $15/MTok
+    newer opus/sonnet  priced like the latest known model of the family
 
   {} 📂
-    CLI DB:   {}
-    Archive:  {}
+    CLI sessions: {}
+    CLI DB:       {}
+    Archive:      {}
 """.format(
             c("⚡", "yellow"), c("Kiro Usage Tracker", "bold", "cyan"),
             c("Usage:", "bold"), c("📋 Commands:", "bold"),
             c("🚩 Flags:", "bold"), c("📊 Metrics:", "bold"),
             c("💲 Pricing $/MTok:", "bold"),
-            c("Data sources:", "dim"), CLI_DB, SESSIONS_DIR))
+            c("Data sources:", "dim"), CLI_SESSIONS_DIR, CLI_DB, SESSIONS_DIR))
         return
 
     period = PERIODS.get(cmd)
